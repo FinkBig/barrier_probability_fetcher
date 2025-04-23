@@ -39,18 +39,18 @@ The analysis relies on three main data sources:
     * **Filename:** The filename **must** contain the start and end dates of the data period in `DD-MM-YYYY` format (e.g., `polymarket-price-data-07-03-2025-14-03-2025-someid.csv`). These dates are crucial as they define the analysis window and are used to infer the expiry dates for both Polymarket (18:00 UTC on end date) and Deribit (08:00 UTC on end date).
 
 2.  **Deribit Options Market Data:**
-    * **Source:** Fetched programmatically from the Deribit Historical Data API (`src/01_deribit_options_fetcher.py`).
-    * **Content:** Raw historical trade data for Bitcoin options contracts expiring at the inferred Deribit expiry time (08:00 UTC). This includes trade timestamp, price, volume (amount), underlying index price, and potentially implied volatility for various strike prices (both Calls and Puts).
+    * **Source:** Fetched programmatically from the Deribit Historical Data API (`src/01_deribit_options_fetcher.py`)[cite: 1].
+    * **Content:** Raw historical trade data for Bitcoin options contracts expiring at the inferred Deribit expiry time (08:00 UTC). This includes trade timestamp, price, volume (amount), underlying index price, and potentially implied volatility for various strike prices (both Calls and Puts)[cite: 1].
 
 3.  **Binance Spot Market Data:**
-    * **Source:** Fetched programmatically from the Binance API (`src/02_binance_spot_fetcher.py`).
-    * **Content:** Historical hourly OHLCV (Open, High, Low, Close, Volume) data for the BTCUSDT trading pair. The 'close' price is used as the hourly spot price reference throughout the analysis.
+    * **Source:** Fetched programmatically from the Binance API (`src/02_binance_spot_fetcher.py`)[cite: 2].
+    * **Content:** Historical hourly OHLCV (Open, High, Low, Close, Volume) data for the BTCUSDT trading pair. The 'close' price is used as the hourly spot price reference throughout the analysis[cite: 2].
 
 ### Data Processing Workflow
 
 The pipeline processes the data in several stages:
 
-1.  **Fetch Raw Data:** Retrieves Deribit options trades and Binance spot prices for the time window defined by the selected Polymarket file (`src/01`, `src/02`).
+1.  **Fetch Raw Data:** Retrieves Deribit options trades and Binance spot prices for the time window defined by the selected Polymarket file (`src/01`, `src/02`)[cite: 1, 2].
 2.  **Clean Deribit Data:** Filters the raw Deribit trades for the specific target expiry date, selects essential columns, standardizes names (e.g., 'price' -> 'option_price'), extracts strike price and option type (Call/Put) from the instrument name (`src/03`).
 3.  **Calculate RND:** Computes the hourly Risk-Neutral Density from the cleaned Deribit options data (details below) (`src/04`).
 4.  **Combine Data:** Merges the hourly data streams. It parses Polymarket's price bucket headers into strike ranges, integrates the hourly RND curve over these ranges to get comparable probabilities, aligns these with Polymarket probabilities and Binance spot prices, calculates a Deribit volume proxy for each bucket, normalizes Polymarket probabilities per hour, and applies outlier capping (`src/05`).
@@ -73,7 +73,7 @@ The Risk-Neutral Density (RND) represents the probability distribution of the fu
 
 ### Results and Interpretation
 
-The final output of the pipeline is stored in the `data/reports/[market_id]/` folder and includes:
+**The primary final results for each analyzed market can be found within the `data/reports/[market_id]/` directory.** This includes the combined dataset, summary statistics, and visualization plots described below:
 
 * **Combined Data CSV (`comparison_[market_id].csv`):** An hourly dataset containing:
     * `timestamp`: The specific hour (UTC).
@@ -88,7 +88,7 @@ The final output of the pipeline is stored in the `data/reports/[market_id]/` fo
 * **Summary Statistics (`summary_stats_[market_id].txt`):** Text file containing quantitative measures of the comparison:
     * Overall mean, median, and standard deviation of the difference between Polymarket and RND probabilities.
     * Breakdown of these statistics by strike range and time to expiration.
-    * (Optional) Dynamic Time Warping (DTW) distance: A measure of similarity between the time series of the two probability sources for each bucket.
+    * (Optional) Dynamic Time Warping (DTW) distance: A measure of similarity between the time series of the two probability sources for each bucket (requires `fastdtw` library).
     * Correlation between changes in spot price and changes in probabilities from both sources.
 
 **Overall Goal:** The results aim to shed light on how these two different markets price the probability of future Bitcoin price movements. Discrepancies could arise from different participant bases, market microstructures, risk premia, or information efficiency. The analysis explores the magnitude, persistence, and potential drivers (like time to expiry or moneyness) of these differences.
@@ -117,13 +117,13 @@ The final output of the pipeline is stored in the `data/reports/[market_id]/` fo
     ```bash
     source .venv/bin/activate # Or equivalent
     ```
-2.  **Run the Main Script:** Execute `main.py` from the root `thesis2.0` directory.
+2.  **Run the Main Script:** Execute `main.py` from the root `thesis2.0` (or your renamed folder) directory.
     ```bash
     python main.py
     ```
 3.  **Select File:** The script will list the available Polymarket files found in `data/polymarket_data/`. Enter the number corresponding to the file you want to analyze.
 4.  **Execution:** The pipeline will execute the steps outlined above sequentially, logging progress and errors.
-5.  **Output:** Intermediate data files are saved in the relevant `data/` subdirectories. The final outputs for the selected market (identified by `market_id`, e.g., `14MAR25`) are saved in `data/reports/[market_id]/`.
+5.  **Output:** Intermediate data files are saved in the relevant `data/` subdirectories (see Project Structure). **The final data results and analysis output** for the selected market (identified by `market_id`, e.g., `14MAR25`), including the combined comparison CSV, summary statistics, and plots, **are located in the `data/reports/[market_id]/` directory.**
 
 ## Configuration
 
@@ -135,4 +135,10 @@ Some key parameters are set in `main.py` within the `PIPELINE_CONFIG` dictionary
 
 ## Script Descriptions
 
-(Descriptions remain the same as provided in the previous response - omitted here for brevity but should be kept in the actual file)
+* **`src/01_deribit_options_fetcher.py`**: Fetches raw historical option trades from Deribit API for a specific currency, date range, and expiry time derived from the Polymarket filename[cite: 1].
+* **`src/02_binance_spot_fetcher.py`**: Fetches historical hourly Kline (OHLCV) data from Binance API for a specific symbol and date range derived from the Polymarket filename[cite: 2].
+* **`src/03_options_cleaner.py`**: Cleans raw Deribit trades, filters by expiry date, selects/renames columns, derives strike and type (Call/Put).
+* **`src/04_rnd_calculator.py`**: Calculates hourly Risk-Neutral Density from cleaned option data using the Breeden-Litzenberger approach with spline interpolation and smoothing. Includes arbitrage checks and uses parallel processing.
+* **`src/05_combine_rnd_polymarket_spot.py`**: Combines hourly RNDs, Polymarket probabilities (parsed from wide format headers), Binance spot prices, and Deribit volume proxies. Integrates RND over Polymarket buckets, normalizes probabilities, and applies outlier capping.
+* **`src/06_analyze_report.py`**: Analyzes the combined data, generates summary statistics (including differences, optional DTW, correlations), and creates visualizations comparing Polymarket and RND probabilities over time.
+* **`main.py`**: Orchestrates the execution of the pipeline steps based on user selection of a Polymarket input file and derived date parameters. Handles configuration and logging.
