@@ -1,0 +1,48 @@
+Overall Mean Difference: 0.57%
+Overall Median Difference: 0.26%
+Overall Std Dev of Difference: 12.95%
+Overall Count: 959
+
+By Strike Range:
+  83-85k: Mean=-2.41%, Median=-0.06%, Std=12.03%, Count=137.0
+  85-87k: Mean=-3.20%, Median=-1.55%, Std=10.13%, Count=137.0
+  87-89k: Mean=-4.55%, Median=-0.87%, Std=9.51%, Count=137.0
+  89-91k: Mean=-2.37%, Median=-0.44%, Std=5.85%, Count=137.0
+  91-93k: Mean=-0.96%, Median=0.35%, Std=4.92%, Count=137.0
+  <83k: Mean=18.64%, Median=20.35%, Std=19.26%, Count=137.0
+  >93k: Mean=-1.12%, Median=0.10%, Std=4.68%, Count=137.0
+
+By Weeks to Expiration:
+  0 weeks: Mean=0.57%, Median=0.26%, Std=12.95%, Count=959.0
+
+DTW Distances by Strike Range (Polymarket vs Deribit):
+  83-85k: Error during DTW calculation.
+  85-87k: Error during DTW calculation.
+  87-89k: Error during DTW calculation.
+  89-91k: Error during DTW calculation.
+  91-93k: Error during DTW calculation.
+  <83k: Error during DTW calculation.
+  >93k: Error during DTW calculation.
+
+Correlation with Spot Price Changes by Strike Range:
+  83-85k:
+    Polymarket Probability Change: -0.0149
+    Deribit Probability Change: nan
+  85-87k:
+    Polymarket Probability Change: -0.1202
+    Deribit Probability Change: nan
+  87-89k:
+    Polymarket Probability Change: -0.0185
+    Deribit Probability Change: nan
+  89-91k:
+    Polymarket Probability Change: 0.0721
+    Deribit Probability Change: nan
+  91-93k:
+    Polymarket Probability Change: -0.1884
+    Deribit Probability Change: nan
+  <83k:
+    Polymarket Probability Change: -0.0520
+    Deribit Probability Change: nan
+  >93k:
+    Polymarket Probability Change: 0.0209
+    Deribit Probability Change: nan

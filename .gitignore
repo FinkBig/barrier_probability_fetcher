@@ -1,0 +1,23 @@
+# Python virtual environment
+.venv/
+venv/
+env/
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# IDE/Editor specific files (optional examples)
+.idea/
+.vscode/
+
+# Large data files (Optional - uncomment and adjust if needed)
+# data/intermediate/*.csv
+# data/final/*.csv
+# data/raw/*.csv
