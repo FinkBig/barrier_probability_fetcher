@@ -1,5 +1,7 @@
 # Polymarket vs Deribit RND Analysis (Thesis Project)
 
+RESULTS CAN BE FOUND IN DATA/REPORTS
+
 This project analyzes and compares implied probability distributions derived from Deribit Bitcoin options (using Risk-Neutral Density - RND) with probabilities from Polymarket prediction markets for corresponding price ranges. The goal is to understand how expectations reflected in these two distinct market types align or differ.
 
 ## Project Structure
