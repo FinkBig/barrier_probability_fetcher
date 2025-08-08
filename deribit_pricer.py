@@ -261,7 +261,7 @@ def compute_barrier_probabilities_from_arrays(unix: np.ndarray, underlying: np.n
 
 
 # ---------- Plotting ----------
-fig, ax = plt.subplots(figsize=(8, 6))
+fig, ax = plt.subplots(figsize=(12, 6))  # Increased figure size for more strikes
 def update_bar_chart(asset: str, results: List[Dict], expiry_ts: int):
     logger.debug("Updating chart with results: %s", results)
     ax.clear()
@@ -269,11 +269,11 @@ def update_bar_chart(asset: str, results: List[Dict], expiry_ts: int):
     probs = [r["last_barrier_prob"] if r["last_barrier_prob"] is not None else 0 for r in results]
     expiry_dt = datetime.fromtimestamp(expiry_ts, tz=timezone.utc)
     expiry_str = expiry_dt.strftime("%d%b").upper()  # e.g., 29AUG
-    bars = ax.bar(strikes, probs, align='center', alpha=0.8, color='skyblue', label='Barrier Prob')
+    bars = ax.bar(range(len(strikes)), probs, align='center', width=0.8, alpha=0.8, color='skyblue', label='Barrier Prob')
     ax.set_xlabel("Strike Price")
     ax.set_ylabel("Barrier Probability")
     ax.set_title(f"Asset = {asset}, Expiration = {expiry_str}")
-    ax.set_ylim(0, 1)
+    ax.set_ylim(0, 1.1)  # Add padding above 1.0 to prevent clipping
     ax.set_xticks(range(len(strikes)))
     ax.set_xticklabels(strikes, rotation=45, ha='right')
     ax.grid(True, axis='y', linestyle='--', alpha=0.7)
@@ -282,8 +282,9 @@ def update_bar_chart(asset: str, results: List[Dict], expiry_ts: int):
         height = bar.get_height()
         ax.text(bar.get_x() + bar.get_width()/2., height,
                 f'{height:.2f}' if height > 0 else '',
-                ha='center', va='bottom')
-    plt.tight_layout()
+                ha='center', va='bottom' if height < 0.95 else 'top',  # Adjust text position for high values
+                fontsize=8)
+    plt.tight_layout(pad=2.0)  # Increase padding
     plt.draw()
     plt.pause(0.1)  # Brief pause to ensure display
 
