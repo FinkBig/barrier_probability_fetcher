@@ -1,4 +1,4 @@
-# Deribit Barrier Probability Pricer
+# Deribit Barrier Probability Fetcher
 
 A real-time WebSocket-based barrier probability calculator for Deribit options. This tool continuously monitors option prices and calculates barrier hit probabilities for specified strikes, providing live streaming updates and visual charts.
 
@@ -46,16 +46,19 @@ python deribit_pricer.py --asset BTC --strike 50000 60000 70000
 ### Examples
 
 **Monitor BTC options with multiple strikes:**
+
 ```bash
 python deribit_pricer.py --asset BTC --strike 45000 50000 55000 60000
 ```
 
 **Monitor ETH options with custom interval:**
+
 ```bash
 python deribit_pricer.py --asset ETH --strike 3000 3500 4000 --interval 10
 ```
 
 **Minimal output mode for data processing:**
+
 ```bash
 python deribit_pricer.py --asset BTC --strike 50000 60000 --minimal
 ```
