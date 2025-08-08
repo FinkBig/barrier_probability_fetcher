@@ -7,13 +7,16 @@ WebSocket-only Deribit barrier probability pricer (live streaming).
 - Outputs JSON lines to stdout for integration.
 - Displays live bar chart of barrier probabilities.
 - Run separate instances for multiple assets if needed.
+- Saves data to CSV log files in data_logs folder.
 """
 
 from __future__ import annotations
 import argparse
 import asyncio
+import csv
 import json
 import logging
+import os
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -95,6 +98,75 @@ def ms_to_s_if_needed(ts: int) -> int:
     if ts > 10**12:
         return int(ts / 1000)
     return int(ts)
+
+
+# ---------- CSV Logging ----------
+class CSVLogger:
+    def __init__(self, asset: str, data_logs_dir: str = "data_logs"):
+        self.asset = asset.upper()
+        self.data_logs_dir = data_logs_dir
+        self.csv_file = None
+        self.csv_writer = None
+        self._setup_csv_file()
+    
+    def _setup_csv_file(self):
+        """Create CSV file with timestamp and asset name"""
+        # Ensure data_logs directory exists
+        os.makedirs(self.data_logs_dir, exist_ok=True)
+        
+        # Create filename with timestamp and asset
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{self.asset}_{timestamp}.csv"
+        filepath = os.path.join(self.data_logs_dir, filename)
+        
+        # Create and open CSV file
+        self.csv_file = open(filepath, 'w', newline='', encoding='utf-8')
+        self.csv_writer = csv.writer(self.csv_file)
+        
+        # Write header
+        header = [
+            'timestamp', 'timestamp_iso', 'asset', 'spot', 'strike', 'option_type',
+            'expiry_ts', 'expiry_iso', 'underlying_price', 'iv_pct', 'barrier_prob', 'n_points'
+        ]
+        self.csv_writer.writerow(header)
+        
+        logger.info(f"CSV logging started: {filepath}")
+    
+    def log_data(self, output_data: Dict[str, Any]):
+        """Log data to CSV file"""
+        if not self.csv_writer:
+            return
+        
+        timestamp = output_data.get('timestamp', now_unix())
+        timestamp_iso = iso_from_unix(timestamp)
+        asset = output_data.get('asset', self.asset)
+        spot = output_data.get('spot', 0.0)
+        
+        for result in output_data.get('results', []):
+            row = [
+                timestamp,
+                timestamp_iso,
+                asset,
+                spot,
+                result.get('strike', 0.0),
+                result.get('option_type', ''),
+                result.get('expiry_ts', 0),
+                result.get('expiry_iso', ''),
+                result.get('last_underlying', 0.0),
+                result.get('last_iv_pct', 0.0),
+                result.get('last_barrier_prob', 0.0),
+                result.get('n_points', 0)
+            ]
+            self.csv_writer.writerow(row)
+        
+        # Flush to ensure data is written immediately
+        self.csv_file.flush()
+    
+    def close(self):
+        """Close CSV file"""
+        if self.csv_file:
+            self.csv_file.close()
+            logger.info(f"CSV logging stopped for {self.asset}")
 
 
 # ---------- Minimal WebSocket JSON-RPC client ----------
@@ -292,6 +364,10 @@ def update_bar_chart(asset: str, results: List[Dict], expiry_ts: int):
 # ---------- Live streaming ----------
 async def live_stream(client: DeribitWS, asset: str, strikes: List[float], interval: int, minimal: bool = False):
     asset = asset.upper()
+    
+    # Initialize CSV logger
+    csv_logger = CSVLogger(asset)
+    
     # Get initial spot
     index_resp = await client.get_index(asset)
     spot = None
@@ -361,85 +437,91 @@ async def live_stream(client: DeribitWS, asset: str, strikes: List[float], inter
     last_output = 0
     plt.ion()  # Enable interactive mode
     plt.show(block=False)  # Initialize plot window without blocking
-    while True:
-        try:
-            # Process recent messages
-            msgs = client.last_messages
-            client.last_messages = []  # Clear to avoid reprocessing
-            for msg in msgs:
-                if not isinstance(msg, dict):
-                    continue
-                params = msg.get("params") or {}
-                ch = params.get("channel", "")
-                data = params.get("data") or {}
-                ts_ms = data.get("timestamp")
-                ts = ms_to_s_if_needed(int(ts_ms)) if ts_ms else now_unix()
+    try:
+        while True:
+            try:
+                # Process recent messages
+                msgs = client.last_messages
+                client.last_messages = []  # Clear to avoid reprocessing
+                for msg in msgs:
+                    if not isinstance(msg, dict):
+                        continue
+                    params = msg.get("params") or {}
+                    ch = params.get("channel", "")
+                    data = params.get("data") or {}
+                    ts_ms = data.get("timestamp")
+                    ts = ms_to_s_if_needed(int(ts_ms)) if ts_ms else now_unix()
 
-                # Update spot from perpetual
-                if ch == perp_ch:
-                    new_spot = data.get("index_price") or data.get("estimated_delivery_price")
-                    if new_spot:
-                        spot = float(new_spot)
+                    # Update spot from perpetual
+                    if ch == perp_ch:
+                        new_spot = data.get("index_price") or data.get("estimated_delivery_price")
+                        if new_spot:
+                            spot = float(new_spot)
 
-                # Update options
+                    # Update options
+                    for s, inst in chosen.items():
+                        name = inst["instrument_name"]
+                        if ch == f"ticker.{name}.100ms":
+                            underlying_val = data.get("underlying_price")
+                            iv_val = data.get("mark_iv")
+                            if underlying_val and iv_val:
+                                storage[s]["unix"].append(int(ts))
+                                storage[s]["underlying"].append(float(underlying_val))
+                                storage[s]["iv"].append(float(iv_val))
+                                # Trim to max points
+                                for key in storage[s]:
+                                    storage[s][key] = storage[s][key][-MAX_POINTS:]
+
+                # Periodic output
+                current_time = time.time()
+                if current_time - last_output >= interval:
+                    results = []
+                    for s in strikes:
+                        inst = chosen[s]
+                        expiry_ts = inst["expiration_ts"]
+                        opt_type = inst["option_type"]
+                        arr_unix = np.array(storage[s]["unix"], dtype=float)
+                        arr_underlying = np.array(storage[s]["underlying"], dtype=float)
+                        arr_iv = np.array(storage[s]["iv"], dtype=float)
+                        rec = compute_barrier_probabilities_from_arrays(arr_unix, arr_underlying, arr_iv, float(s), int(expiry_ts), opt_type)
+                        results.append(rec)
+                    if minimal:
+                        minimal_output = {
+                            "asset": asset,
+                            "timestamp": now_unix(),
+                            "probabilities": [
+                                {"strike": r["strike"], "barrier_prob": r["last_barrier_prob"]} for r in results
+                            ],
+                        }
+                        print(json.dumps(minimal_output), flush=True)
+                    else:
+                        output = {
+                            "asset": asset,
+                            "spot": spot,
+                            "timestamp": now_unix(),
+                            "results": results,
+                        }
+                        print(json.dumps(output), flush=True)
+                        # Log to CSV
+                        csv_logger.log_data(output)
+                    # Update bar chart
+                    if results and any(r["last_barrier_prob"] is not None for r in results):
+                        update_bar_chart(asset, results, expiry_ts)
+                    last_output = current_time
+
+                await asyncio.sleep(0.1)  # Small sleep to yield
+            except Exception as e:
+                logger.error("Error in live stream: %s", e)
+                await client.disconnect()
+                await asyncio.sleep(RECONNECT_DELAY)
+                await client.connect()
+                await client.subscribe(perp_ch)
                 for s, inst in chosen.items():
-                    name = inst["instrument_name"]
-                    if ch == f"ticker.{name}.100ms":
-                        underlying_val = data.get("underlying_price")
-                        iv_val = data.get("mark_iv")
-                        if underlying_val and iv_val:
-                            storage[s]["unix"].append(int(ts))
-                            storage[s]["underlying"].append(float(underlying_val))
-                            storage[s]["iv"].append(float(iv_val))
-                            # Trim to max points
-                            for key in storage[s]:
-                                storage[s][key] = storage[s][key][-MAX_POINTS:]
-
-            # Periodic output
-            current_time = time.time()
-            if current_time - last_output >= interval:
-                results = []
-                for s in strikes:
-                    inst = chosen[s]
-                    expiry_ts = inst["expiration_ts"]
-                    opt_type = inst["option_type"]
-                    arr_unix = np.array(storage[s]["unix"], dtype=float)
-                    arr_underlying = np.array(storage[s]["underlying"], dtype=float)
-                    arr_iv = np.array(storage[s]["iv"], dtype=float)
-                    rec = compute_barrier_probabilities_from_arrays(arr_unix, arr_underlying, arr_iv, float(s), int(expiry_ts), opt_type)
-                    results.append(rec)
-                if minimal:
-                    minimal_output = {
-                        "asset": asset,
-                        "timestamp": now_unix(),
-                        "probabilities": [
-                            {"strike": r["strike"], "barrier_prob": r["last_barrier_prob"]} for r in results
-                        ],
-                    }
-                    print(json.dumps(minimal_output), flush=True)
-                else:
-                    output = {
-                        "asset": asset,
-                        "spot": spot,
-                        "timestamp": now_unix(),
-                        "results": results,
-                    }
-                    print(json.dumps(output), flush=True)
-                # Update bar chart
-                if results and any(r["last_barrier_prob"] is not None for r in results):
-                    update_bar_chart(asset, results, expiry_ts)
-                last_output = current_time
-
-            await asyncio.sleep(0.1)  # Small sleep to yield
-        except Exception as e:
-            logger.error("Error in live stream: %s", e)
-            await client.disconnect()
-            await asyncio.sleep(RECONNECT_DELAY)
-            await client.connect()
-            await client.subscribe(perp_ch)
-            for s, inst in chosen.items():
-                ch = f"ticker.{inst['instrument_name']}.100ms"
-                await client.subscribe(ch)
+                    ch = f"ticker.{inst['instrument_name']}.100ms"
+                    await client.subscribe(ch)
+    finally:
+        # Clean up CSV logger
+        csv_logger.close()
 
 
 # ---------- CLI & entry ----------
