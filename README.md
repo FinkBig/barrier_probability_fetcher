@@ -33,7 +33,7 @@ pip install -r requirements.txt
 ### Basic Usage
 
 ```bash
-python deribit_pricer.py --asset BTC --strike 50000 60000 70000
+python deribit_pricer.py --asset BTC --strike 100000 110000 120000
 ```
 
 ### Command Line Options
@@ -48,19 +48,13 @@ python deribit_pricer.py --asset BTC --strike 50000 60000 70000
 **Monitor BTC options with multiple strikes:**
 
 ```bash
-python deribit_pricer.py --asset BTC --strike 45000 50000 55000 60000
-```
-
-**Monitor ETH options with custom interval:**
-
-```bash
-python deribit_pricer.py --asset ETH --strike 3000 3500 4000 --interval 10
+python deribit_pricer.py --asset BTC --strike 100000 110000 120000
 ```
 
 **Minimal output mode for data processing:**
 
 ```bash
-python deribit_pricer.py --asset BTC --strike 50000 60000 --minimal
+python deribit_pricer.py --asset ETH --strike 3300 4000 4200 --minimal
 ```
 
 ## Output
