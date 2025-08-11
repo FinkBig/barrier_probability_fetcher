@@ -1,0 +1,9 @@
+websocket_uri: "wss://www.deribit.com/ws/api/v2"
+rpc_timeout: 8.0
+min_iv: 0.5
+max_iv: 1000.0
+monthly_day_min: 24
+monthly_day_max: 3
+interval: 5
+reconnect_delays: [5, 10, 20, 40]
+iv_timeout: 30

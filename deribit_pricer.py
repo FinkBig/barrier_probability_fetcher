@@ -6,8 +6,10 @@ WebSocket-only Deribit barrier probability pricer (live streaming).
 - Continuous updates every interval seconds.
 - Outputs JSON lines to stdout for integration.
 - Displays live bar chart of barrier probabilities.
-- Run separate instances for multiple assets if needed.
+- Stores all historical data for comparison with Polymarket.
 - Saves data to CSV log files in data_logs folder.
+- Uses current time and spot price for real-time calculations.
+- Configurable via YAML file.
 """
 
 from __future__ import annotations
@@ -26,17 +28,32 @@ import numpy as np
 import websockets
 from scipy.stats import norm
 import matplotlib.pyplot as plt
+import yaml
+import calendar
 
-# ---------- Config ----------
-DERIBIT_WS = "wss://www.deribit.com/ws/api/v2"
-WS_RPC_TIMEOUT = 8.0
-MIN_IV = 0.5
-MAX_IV = 1000.0
-MONTHLY_DAY_MIN = 24
-MONTHLY_DAY_MAX = 3  # day <= 3 also considered monthly-start
-DEFAULT_INTERVAL = 5  # seconds between outputs
-MAX_POINTS = 100  # keep last N points per instrument
-RECONNECT_DELAY = 5  # seconds to wait before reconnect
+# ---------- Config Loading ----------
+def load_config(config_path: str = "config.yaml") -> Dict[str, Any]:
+    try:
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+        return config
+    except FileNotFoundError:
+        logger.error(f"Config file {config_path} not found")
+        raise
+    except Exception as e:
+        logger.error(f"Error loading config: {e}")
+        raise
+
+CONFIG = load_config()
+DERIBIT_WS = CONFIG.get("websocket_uri", "wss://www.deribit.com/ws/api/v2")
+WS_RPC_TIMEOUT = CONFIG.get("rpc_timeout", 8.0)
+MIN_IV = CONFIG.get("min_iv", 0.5)
+MAX_IV = CONFIG.get("max_iv", 1000.0)
+MONTHLY_DAY_MIN = CONFIG.get("monthly_day_min", 24)
+MONTHLY_DAY_MAX = CONFIG.get("monthly_day_max", 3)
+DEFAULT_INTERVAL = CONFIG.get("interval", 5)
+RECONNECT_DELAYS = CONFIG.get("reconnect_delays", [5, 10, 20, 40])
+IV_TIMEOUT = CONFIG.get("iv_timeout", 30)  # seconds to wait for IV data
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,7 +63,7 @@ logging.basicConfig(
 logger = logging.getLogger("deribit_pricer")
 
 # Set matplotlib backend for macOS compatibility
-plt.switch_backend('TkAgg')  # Use Tkinter backend, common for macOS
+plt.switch_backend('TkAgg')
 
 # ---------- Math helpers (r=0, q=0) ----------
 def prob_hit_upper(F: np.ndarray, H: float, T: np.ndarray, sigma: np.ndarray, r: float = 0.0, q: float = 0.0) -> np.ndarray:
@@ -64,7 +81,6 @@ def prob_hit_upper(F: np.ndarray, H: float, T: np.ndarray, sigma: np.ndarray, r:
     p = term1 + term2
     result[valid] = np.clip(p, 0, 1)
     return result
-
 
 def prob_hit_lower(F: np.ndarray, L: float, T: np.ndarray, sigma: np.ndarray, r: float = 0.0, q: float = 0.0) -> np.ndarray:
     nu = r - q - 0.5 * sigma**2
@@ -84,21 +100,17 @@ def prob_hit_lower(F: np.ndarray, L: float, T: np.ndarray, sigma: np.ndarray, r:
     result[valid] = np.clip(p, 0, 1)
     return result
 
-
 # ---------- Utilities ----------
 def now_unix() -> int:
     return int(time.time())
 
-
 def iso_from_unix(s: int) -> str:
     return datetime.fromtimestamp(int(s), tz=timezone.utc).isoformat()
-
 
 def ms_to_s_if_needed(ts: int) -> int:
     if ts > 10**12:
         return int(ts / 1000)
     return int(ts)
-
 
 # ---------- CSV Logging ----------
 class CSVLogger:
@@ -110,38 +122,26 @@ class CSVLogger:
         self._setup_csv_file()
     
     def _setup_csv_file(self):
-        """Create CSV file with timestamp and asset name"""
-        # Ensure data_logs directory exists
         os.makedirs(self.data_logs_dir, exist_ok=True)
-        
-        # Create filename with timestamp and asset
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{self.asset}_{timestamp}.csv"
         filepath = os.path.join(self.data_logs_dir, filename)
-        
-        # Create and open CSV file
         self.csv_file = open(filepath, 'w', newline='', encoding='utf-8')
         self.csv_writer = csv.writer(self.csv_file)
-        
-        # Write header
         header = [
             'timestamp', 'timestamp_iso', 'asset', 'spot', 'strike', 'option_type',
             'expiry_ts', 'expiry_iso', 'underlying_price', 'iv_pct', 'barrier_prob', 'n_points'
         ]
         self.csv_writer.writerow(header)
-        
         logger.info(f"CSV logging started: {filepath}")
     
     def log_data(self, output_data: Dict[str, Any]):
-        """Log data to CSV file"""
         if not self.csv_writer:
             return
-        
         timestamp = output_data.get('timestamp', now_unix())
         timestamp_iso = iso_from_unix(timestamp)
         asset = output_data.get('asset', self.asset)
         spot = output_data.get('spot', 0.0)
-        
         for result in output_data.get('results', []):
             row = [
                 timestamp,
@@ -158,16 +158,12 @@ class CSVLogger:
                 result.get('n_points', 0)
             ]
             self.csv_writer.writerow(row)
-        
-        # Flush to ensure data is written immediately
         self.csv_file.flush()
     
     def close(self):
-        """Close CSV file"""
         if self.csv_file:
             self.csv_file.close()
             logger.info(f"CSV logging stopped for {self.asset}")
-
 
 # ---------- Minimal WebSocket JSON-RPC client ----------
 class DeribitWS:
@@ -214,7 +210,6 @@ class DeribitWS:
                 except Exception:
                     continue
                 self.last_messages.append(msg)
-                # match id -> future
                 if isinstance(msg, dict) and "id" in msg:
                     rid = msg["id"]
                     fut = self._pending.pop(rid, None)
@@ -253,99 +248,61 @@ class DeribitWS:
 
     async def get_instruments(self, currency: str) -> list:
         res = await self._rpc("public/get_instruments", {"currency": currency, "kind": "option", "expired": False})
-        if isinstance(res, dict) and "instruments" in res:
-            return res["instruments"]
         return res
-
 
 # ---------- Expiry selection ----------
 def pick_nearest_monthly_expiry(candidates: List[int], now_s: int) -> Optional[int]:
     if not candidates:
+        logger.warning("No expiry candidates provided")
         return None
+    
+    now_dt = datetime.fromtimestamp(now_s, tz=timezone.utc)
+    current_year = now_dt.year
+    current_month = now_dt.month
+    target_month = current_month if now_dt.day <= 15 else current_month + 1
+    if target_month > 12:
+        target_month = 1
+        current_year += 1
+    
     monthly = []
     for ts in candidates:
         dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
-        if dt.day >= MONTHLY_DAY_MIN or dt.day <= MONTHLY_DAY_MAX:
-            monthly.append(ts)
-    if not monthly:
-        return None
-    return min(monthly, key=lambda x: abs(x - now_s))
-
-
-# ---------- Compute barrier from arrays ----------
-def compute_barrier_probabilities_from_arrays(unix: np.ndarray, underlying: np.ndarray, iv: np.ndarray,
-                                             strike: float, expiry_ts: int, option_type: str) -> Dict[str, Any]:
-    mask = unix <= expiry_ts
-    unix = unix[mask]
-    underlying = underlying[mask]
-    iv = iv[mask]
-    if unix.size == 0:
-        return {
-            "strike": strike,
-            "option_type": option_type,
-            "expiry_ts": expiry_ts,
-            "expiry_iso": iso_from_unix(expiry_ts),
-            "last_unix": None,
-            "last_iso": None,
-            "last_underlying": None,
-            "last_iv_pct": None,
-            "last_barrier_prob": None,
-            "n_points": 0,
-        }
-    iv_mask = (iv >= MIN_IV) & (iv <= MAX_IV)
-    unix = unix[iv_mask]
-    underlying = underlying[iv_mask]
-    iv = iv[iv_mask]
-    if unix.size == 0:
-        return {
-            "strike": strike,
-            "option_type": option_type,
-            "expiry_ts": expiry_ts,
-            "expiry_iso": iso_from_unix(expiry_ts),
-            "last_unix": None,
-            "last_iso": None,
-            "last_underlying": None,
-            "last_iv_pct": None,
-            "last_barrier_prob": None,
-            "n_points": 0,
-        }
-    F = underlying.copy()
-    T = (expiry_ts - unix) / (365.25 * 86400.0)
-    T = np.clip(T, 1e-12, None)
-    sigma = iv / 100.0
-    if option_type.lower().startswith("c"):
-        barrier = prob_hit_upper(F, strike, T, sigma, r=0.0, q=0.0)
-    else:
-        barrier = prob_hit_lower(F, strike, T, sigma, r=0.0, q=0.0)
-    idx = -1
-    return {
-        "strike": strike,
-        "option_type": option_type,
-        "expiry_ts": int(expiry_ts),
-        "expiry_iso": iso_from_unix(int(expiry_ts)),
-        "last_unix": int(unix[idx]),
-        "last_iso": iso_from_unix(int(unix[idx])),
-        "last_underlying": float(F[idx]),
-        "last_iv_pct": float(iv[idx]),
-        "last_barrier_prob": float(barrier[idx]),
-        "n_points": int(len(F)),
-    }
-
+        days_to_expiry = (ts - now_s) / 86400.0
+        if (dt.year == current_year and dt.month == target_month and dt.day >= MONTHLY_DAY_MIN) or \
+           (dt.year == current_year + (1 if target_month == 1 else 0) and dt.month == target_month and dt.day >= MONTHLY_DAY_MIN):
+            if 10 <= days_to_expiry <= 40:
+                monthly.append(ts)
+                logger.debug("Expiry %s (%.2f days) included in monthly filter", iso_from_unix(ts), days_to_expiry)
+    
+    logger.info("Available expiry timestamps: %s", [iso_from_unix(ts) for ts in candidates])
+    logger.info("Filtered monthly expiries: %s", [iso_from_unix(ts) for ts in monthly])
+    
+    target_dt = datetime(current_year, target_month, min(29, calendar.monthrange(current_year, target_month)[1]), tzinfo=timezone.utc)
+    
+    if monthly:
+        selected = min(monthly, key=lambda x: abs(x - int(target_dt.timestamp())))
+        logger.info("Selected expiry: %s", iso_from_unix(selected))
+        return selected
+    logger.warning("No end-of-month expiry found, falling back to nearest expiry")
+    selected = min(candidates, key=lambda x: abs(x - now_s)) if candidates else None
+    if selected:
+        logger.info("Fallback expiry: %s", iso_from_unix(selected))
+    return selected
 
 # ---------- Plotting ----------
-fig, ax = plt.subplots(figsize=(12, 6))  # Increased figure size for more strikes
+fig, ax = plt.subplots(figsize=(12, 6))
 def update_bar_chart(asset: str, results: List[Dict], expiry_ts: int):
     logger.debug("Updating chart with results: %s", results)
     ax.clear()
-    strikes = [f"{int(r['strike']):,}" for r in results]  # Comma-separated thousands
+    strikes = [f"{int(r['strike']):,}" for r in results]
     probs = [r["last_barrier_prob"] if r["last_barrier_prob"] is not None else 0 for r in results]
     expiry_dt = datetime.fromtimestamp(expiry_ts, tz=timezone.utc)
-    expiry_str = expiry_dt.strftime("%d%b").upper()  # e.g., 29AUG
+    expiry_str = expiry_dt.strftime("%d%b").upper()
     bars = ax.bar(range(len(strikes)), probs, align='center', width=0.8, alpha=0.8, color='skyblue', label='Barrier Prob')
     ax.set_xlabel("Strike Price")
     ax.set_ylabel("Barrier Probability")
     ax.set_title(f"Asset = {asset}, Expiration = {expiry_str}")
-    ax.set_ylim(0, 1.1)  # Add padding above 1.0 to prevent clipping
+    ax.set_ylim(0, 1.1)
     ax.set_xticks(range(len(strikes)))
     ax.set_xticklabels(strikes, rotation=45, ha='right')
     ax.grid(True, axis='y', linestyle='--', alpha=0.7)
@@ -354,21 +311,18 @@ def update_bar_chart(asset: str, results: List[Dict], expiry_ts: int):
         height = bar.get_height()
         ax.text(bar.get_x() + bar.get_width()/2., height,
                 f'{height:.2f}' if height > 0 else '',
-                ha='center', va='bottom' if height < 0.95 else 'top',  # Adjust text position for high values
+                ha='center', va='bottom' if height < 0.95 else 'top',
                 fontsize=8)
-    plt.tight_layout(pad=2.0)  # Increase padding
+    plt.tight_layout(pad=2.0)
     plt.draw()
-    plt.pause(0.1)  # Brief pause to ensure display
-
+    plt.pause(0.1)
 
 # ---------- Live streaming ----------
-async def live_stream(client: DeribitWS, asset: str, strikes: List[float], interval: int, minimal: bool = False):
+async def live_stream(client: DeribitWS, asset: str, strikes: List[float], interval: int, minimal: bool = False, callback: Optional[callable] = None):
     asset = asset.upper()
-    
-    # Initialize CSV logger
     csv_logger = CSVLogger(asset)
+    start_time = now_unix()
     
-    # Get initial spot
     index_resp = await client.get_index(asset)
     spot = None
     if isinstance(index_resp, dict):
@@ -378,14 +332,11 @@ async def live_stream(client: DeribitWS, asset: str, strikes: List[float], inter
             spot = float(index_resp["edp"])
     if spot is None:
         raise RuntimeError(f"Could not parse spot for {asset}")
-
     logger.info("Initial spot for %s = %s", asset, spot)
 
-    # Subscribe to perpetual for live spot updates
     perp_ch = f"ticker.{asset}-PERPETUAL.100ms"
     await client.subscribe(perp_ch)
 
-    # Get instruments
     instruments = await client.get_instruments(asset)
     if not instruments:
         raise RuntimeError(f"Empty instrument list for {asset}")
@@ -410,39 +361,50 @@ async def live_stream(client: DeribitWS, asset: str, strikes: List[float], inter
             continue
 
     decision = {s: ("call" if s > spot else "put") for s in strikes}
-
-    chosen = {}
+    all_expiries = []
     for s in strikes:
         key = int(round(s))
         cand = [i for i in by_strike.get(key, []) if i["option_type"] == decision[s]]
         if not cand:
-            raise RuntimeError(f"No live instruments for strike {s} and side {decision[s]}")
+            logger.warning(f"No live instruments for strike {s} and side {decision[s]}")
+            continue
         candidate_ts = [c["expiration_ts"] for c in cand]
-        picked = pick_nearest_monthly_expiry(candidate_ts, now_s)
-        if picked is None:
-            raise RuntimeError(f"No monthly expiry found for strike {s}")
-        picked_inst = next((c for c in cand if c["expiration_ts"] == picked), None)
-        if not picked_inst:
-            raise RuntimeError(f"Could not map expiry for strike {s}")
+        all_expiries.extend(candidate_ts)
+    
+    logger.info("All available expiries: %s", [iso_from_unix(ts) for ts in all_expiries])
+    
+    picked_expiry = pick_nearest_monthly_expiry(all_expiries, now_s)
+    if picked_expiry is None:
+        raise RuntimeError("No monthly expiry found")
+
+    chosen = {}
+    missing_strikes = []
+    for s in strikes:
+        key = int(round(s))
+        cand = [i for i in by_strike.get(key, []) if i["option_type"] == decision[s] and i["expiration_ts"] == picked_expiry]
+        if not cand:
+            missing_strikes.append(s)
+            continue
+        picked_inst = cand[0]
         chosen[s] = picked_inst
+        await client.subscribe(f"ticker.{picked_inst['instrument_name']}.100ms")
+    
+    if missing_strikes:
+        logger.warning("No instruments found for strikes %s with expiry %s", missing_strikes, iso_from_unix(picked_expiry))
+        if not chosen:
+            raise RuntimeError(f"No instruments available for any strikes with expiry {iso_from_unix(picked_expiry)}")
 
-    # Subscribe to option tickers
-    for s, inst in chosen.items():
-        ch = f"ticker.{inst['instrument_name']}.100ms"
-        await client.subscribe(ch)
-
-    # Storage
-    storage = {s: {"unix": [], "underlying": [], "iv": []} for s in strikes}
-
+    storage = {s: {"unix": [], "underlying": [], "iv": []} for s in chosen}
     last_output = 0
-    plt.ion()  # Enable interactive mode
-    plt.show(block=False)  # Initialize plot window without blocking
+    plt.ion()
+    plt.show(block=False)
+    reconnect_attempt = 0
+
     try:
         while True:
             try:
-                # Process recent messages
                 msgs = client.last_messages
-                client.last_messages = []  # Clear to avoid reprocessing
+                client.last_messages = []
                 for msg in msgs:
                     if not isinstance(msg, dict):
                         continue
@@ -452,13 +414,11 @@ async def live_stream(client: DeribitWS, asset: str, strikes: List[float], inter
                     ts_ms = data.get("timestamp")
                     ts = ms_to_s_if_needed(int(ts_ms)) if ts_ms else now_unix()
 
-                    # Update spot from perpetual
                     if ch == perp_ch:
                         new_spot = data.get("index_price") or data.get("estimated_delivery_price")
                         if new_spot:
                             spot = float(new_spot)
 
-                    # Update options
                     for s, inst in chosen.items():
                         name = inst["instrument_name"]
                         if ch == f"ticker.{name}.100ms":
@@ -468,22 +428,48 @@ async def live_stream(client: DeribitWS, asset: str, strikes: List[float], inter
                                 storage[s]["unix"].append(int(ts))
                                 storage[s]["underlying"].append(float(underlying_val))
                                 storage[s]["iv"].append(float(iv_val))
-                                # Trim to max points
-                                for key in storage[s]:
-                                    storage[s][key] = storage[s][key][-MAX_POINTS:]
 
-                # Periodic output
                 current_time = time.time()
                 if current_time - last_output >= interval:
+                    now_ts = now_unix()
                     results = []
-                    for s in strikes:
+                    for s in chosen:
                         inst = chosen[s]
                         expiry_ts = inst["expiration_ts"]
                         opt_type = inst["option_type"]
-                        arr_unix = np.array(storage[s]["unix"], dtype=float)
-                        arr_underlying = np.array(storage[s]["underlying"], dtype=float)
                         arr_iv = np.array(storage[s]["iv"], dtype=float)
-                        rec = compute_barrier_probabilities_from_arrays(arr_unix, arr_underlying, arr_iv, float(s), int(expiry_ts), opt_type)
+                        arr_underlying = np.array([spot], dtype=float)
+                        T = np.array([(expiry_ts - now_ts) / (365.25 * 86400.0)], dtype=float)
+                        T = np.clip(T, 1e-12, None)
+                        if arr_iv.size == 0 or (now_ts - start_time > IV_TIMEOUT and not np.all((arr_iv >= MIN_IV) & (arr_iv <= MAX_IV))):
+                            logger.warning(f"No valid IV data for strike {s} after {IV_TIMEOUT} seconds")
+                            rec = {
+                                "strike": s,
+                                "option_type": opt_type,
+                                "expiry_ts": expiry_ts,
+                                "expiry_iso": iso_from_unix(expiry_ts),
+                                "last_unix": None,
+                                "last_iso": None,
+                                "last_underlying": None,
+                                "last_iv_pct": None,
+                                "last_barrier_prob": None,
+                                "n_points": 0,
+                            }
+                        else:
+                            sigma = np.array([arr_iv[-1] / 100.0], dtype=float)
+                            barrier = prob_hit_upper(arr_underlying, s, T, sigma) if opt_type.lower().startswith("c") else prob_hit_lower(arr_underlying, s, T, sigma)
+                            rec = {
+                                "strike": s,
+                                "option_type": opt_type,
+                                "expiry_ts": int(expiry_ts),
+                                "expiry_iso": iso_from_unix(int(expiry_ts)),
+                                "last_unix": now_ts,
+                                "last_iso": iso_from_unix(now_ts),
+                                "last_underlying": float(arr_underlying[-1]),
+                                "last_iv_pct": float(arr_iv[-1]),
+                                "last_barrier_prob": float(barrier[-1]),
+                                "n_points": 1,
+                            }
                         results.append(rec)
                     if minimal:
                         minimal_output = {
@@ -502,27 +488,28 @@ async def live_stream(client: DeribitWS, asset: str, strikes: List[float], inter
                             "results": results,
                         }
                         print(json.dumps(output), flush=True)
-                        # Log to CSV
                         csv_logger.log_data(output)
-                    # Update bar chart
+                        if callback:
+                            callback(output)
                     if results and any(r["last_barrier_prob"] is not None for r in results):
-                        update_bar_chart(asset, results, expiry_ts)
+                        update_bar_chart(asset, results, picked_expiry)
                     last_output = current_time
+                    reconnect_attempt = 0
 
-                await asyncio.sleep(0.1)  # Small sleep to yield
+                await asyncio.sleep(0.1)
             except Exception as e:
                 logger.error("Error in live stream: %s", e)
                 await client.disconnect()
-                await asyncio.sleep(RECONNECT_DELAY)
+                delay = RECONNECT_DELAYS[min(reconnect_attempt, len(RECONNECT_DELAYS) - 1)]
+                await asyncio.sleep(delay)
+                reconnect_attempt += 1
                 await client.connect()
                 await client.subscribe(perp_ch)
                 for s, inst in chosen.items():
                     ch = f"ticker.{inst['instrument_name']}.100ms"
                     await client.subscribe(ch)
     finally:
-        # Clean up CSV logger
         csv_logger.close()
-
 
 # ---------- CLI & entry ----------
 def parse_strikes_list(arr: List[str]) -> List[float]:
@@ -534,7 +521,6 @@ def parse_strikes_list(arr: List[str]) -> List[float]:
             logger.warning("Skipping invalid strike: %s", s)
     return out
 
-
 def main():
     parser = argparse.ArgumentParser(description="Deribit live barrier pricer.")
     parser.add_argument("--asset", required=True, help="Asset, e.g. BTC")
@@ -544,7 +530,6 @@ def main():
     args = parser.parse_args()
 
     strikes = parse_strikes_list(args.strike)
-
     try:
         async def _run():
             async with DeribitWS() as client:
@@ -553,7 +538,6 @@ def main():
     except Exception as e:
         logger.exception("Failed: %s", e)
         raise SystemExit(1)
-
 
 if __name__ == "__main__":
     main()
