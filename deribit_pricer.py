@@ -4,10 +4,10 @@ deribit_pricer.py
 
 WebSocket-only Deribit barrier probability pricer (live streaming).
 - Continuous updates every interval seconds.
-- Outputs JSON lines to stdout for integration.
+- Outputs clean formatted table to terminal or JSON lines to stdout with --minimal.
 - Displays live bar chart of barrier probabilities.
 - Stores all historical data for comparison with Polymarket.
-- Saves data to CSV log files in data_logs folder.
+- Appends data to a single CSV log file per asset in data_logs/<asset> folder.
 - Uses current time and spot price for real-time calculations.
 - Configurable via YAML file.
 """
@@ -54,6 +54,7 @@ MONTHLY_DAY_MAX = CONFIG.get("monthly_day_max", 3)
 DEFAULT_INTERVAL = CONFIG.get("interval", 5)
 RECONNECT_DELAYS = CONFIG.get("reconnect_delays", [5, 10, 20, 40])
 IV_TIMEOUT = CONFIG.get("iv_timeout", 30)  # seconds to wait for IV data
+SPOT_TIMEOUT = CONFIG.get("spot_timeout", 60)  # seconds to wait for spot update
 
 logging.basicConfig(
     level=logging.INFO,
@@ -116,24 +117,25 @@ def ms_to_s_if_needed(ts: int) -> int:
 class CSVLogger:
     def __init__(self, asset: str, data_logs_dir: str = "data_logs"):
         self.asset = asset.upper()
-        self.data_logs_dir = data_logs_dir
+        self.data_logs_dir = os.path.join(data_logs_dir, self.asset)
         self.csv_file = None
         self.csv_writer = None
         self._setup_csv_file()
     
     def _setup_csv_file(self):
         os.makedirs(self.data_logs_dir, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{self.asset}_{timestamp}.csv"
+        filename = f"{self.asset}_probabilities.csv"
         filepath = os.path.join(self.data_logs_dir, filename)
-        self.csv_file = open(filepath, 'w', newline='', encoding='utf-8')
+        file_exists = os.path.exists(filepath)
+        self.csv_file = open(filepath, 'a', newline='', encoding='utf-8')
         self.csv_writer = csv.writer(self.csv_file)
-        header = [
-            'timestamp', 'timestamp_iso', 'asset', 'spot', 'strike', 'option_type',
-            'expiry_ts', 'expiry_iso', 'underlying_price', 'iv_pct', 'barrier_prob', 'n_points'
-        ]
-        self.csv_writer.writerow(header)
-        logger.info(f"CSV logging started: {filepath}")
+        if not file_exists:
+            header = [
+                'timestamp', 'timestamp_iso', 'asset', 'spot', 'strike', 'option_type',
+                'expiry_ts', 'expiry_iso', 'underlying_price', 'iv_pct', 'barrier_prob', 'n_points'
+            ]
+            self.csv_writer.writerow(header)
+        logger.info(f"CSV logging to: {filepath} (append mode)")
     
     def log_data(self, output_data: Dict[str, Any]):
         if not self.csv_writer:
@@ -300,8 +302,8 @@ def update_bar_chart(asset: str, results: List[Dict], expiry_ts: int):
     expiry_str = expiry_dt.strftime("%d%b").upper()
     bars = ax.bar(range(len(strikes)), probs, align='center', width=0.8, alpha=0.8, color='skyblue', label='Barrier Prob')
     ax.set_xlabel("Strike Price")
-    ax.set_ylabel("Barrier Probability")
-    ax.set_title(f"Asset = {asset}, Expiration = {expiry_str}")
+    ax.set_ylabel("Probability of Hitting Barrier")
+    ax.set_title(f"Live Barrier Probabilities for {asset} (Expiry: {expiry_str})")
     ax.set_ylim(0, 1.1)
     ax.set_xticks(range(len(strikes)))
     ax.set_xticklabels(strikes, rotation=45, ha='right')
@@ -310,18 +312,45 @@ def update_bar_chart(asset: str, results: List[Dict], expiry_ts: int):
     for bar, prob in zip(bars, probs):
         height = bar.get_height()
         ax.text(bar.get_x() + bar.get_width()/2., height,
-                f'{height:.2f}' if height > 0 else '',
+                f'{height:.2%}' if height > 0 else '',
                 ha='center', va='bottom' if height < 0.95 else 'top',
                 fontsize=8)
     plt.tight_layout(pad=2.0)
     plt.draw()
-    plt.pause(0.1)
+    plt.pause(0.01)
+
+# ---------- Formatted Terminal Output ----------
+def print_formatted_output(output: Dict[str, Any]):
+    """Prints a clean, formatted table to the terminal without clearing."""
+    spot = output.get('spot')
+    asset = output.get('asset')
+    expiry_iso = output['results'][0]['expiry_iso'] if output['results'] else 'N/A'
+   
+    print("\n" + "=" * 70)
+    print(f"DERIBIT BARRIER PROBABILITY PRICER".center(70))
+    print("-" * 70)
+    print(f"Asset: {asset:<15} Spot Price: ${spot:,.2f}")
+    print(f"Expiry: {expiry_iso:<30}")
+    print("-" * 70)
+    print(f"{'Strike':>12} | {'Type':>6} | {'Mark IV (%)':>12} | {'Barrier Prob.':>15}")
+    print("-" * 70)
+    for r in output.get('results', []):
+        strike_str = f"${r['strike']:,.0f}"
+        type_str = r['option_type'].capitalize()
+        iv_str = f"{r['last_iv_pct']:.2f}%" if r['last_iv_pct'] is not None else "N/A"
+        prob_str = f"{r['last_barrier_prob']:.2%}" if r['last_barrier_prob'] is not None else "Calculating..."
+        print(f"{strike_str:>12} | {type_str:>6} | {iv_str:>12} | {prob_str:>15}")
+    print("-" * 70)
+    print(f"Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
 
 # ---------- Live streaming ----------
 async def live_stream(client: DeribitWS, asset: str, strikes: List[float], interval: int, minimal: bool = False, callback: Optional[callable] = None):
     asset = asset.upper()
     csv_logger = CSVLogger(asset)
     start_time = now_unix()
+    last_spot_update = start_time  # Track last spot update time
+    last_spot_value = None  # Track last logged spot price for deduplication
+    pending_spot = None  # Track pending spot price change in current cycle
     
     index_resp = await client.get_index(asset)
     spot = None
@@ -333,6 +362,8 @@ async def live_stream(client: DeribitWS, asset: str, strikes: List[float], inter
     if spot is None:
         raise RuntimeError(f"Could not parse spot for {asset}")
     logger.info("Initial spot for %s = %s", asset, spot)
+    last_spot_value = spot
+    pending_spot = spot
 
     perp_ch = f"ticker.{asset}-PERPETUAL.100ms"
     await client.subscribe(perp_ch)
@@ -403,6 +434,25 @@ async def live_stream(client: DeribitWS, asset: str, strikes: List[float], inter
     try:
         while True:
             try:
+                # Check for stale spot price
+                now_ts = now_unix()
+                if now_ts - last_spot_update > SPOT_TIMEOUT:
+                    logger.warning("No spot price update for %s seconds, polling API", SPOT_TIMEOUT)
+                    index_resp = await client.get_index(asset)
+                    new_spot = None
+                    if isinstance(index_resp, dict):
+                        if asset in index_resp:
+                            new_spot = float(index_resp[asset])
+                        elif "edp" in index_resp:
+                            new_spot = float(index_resp["edp"])
+                    if new_spot and new_spot != last_spot_value:
+                        spot = new_spot
+                        last_spot_update = now_ts
+                        logger.info("Updated spot via API poll: %s", spot)
+                        last_spot_value = spot
+                        pending_spot = spot
+
+                # Process recent messages
                 msgs = client.last_messages
                 client.last_messages = []
                 for msg in msgs:
@@ -413,11 +463,15 @@ async def live_stream(client: DeribitWS, asset: str, strikes: List[float], inter
                     data = params.get("data") or {}
                     ts_ms = data.get("timestamp")
                     ts = ms_to_s_if_needed(int(ts_ms)) if ts_ms else now_unix()
+                    logger.debug("Received message for channel %s: %s", ch, data)
 
                     if ch == perp_ch:
                         new_spot = data.get("index_price") or data.get("estimated_delivery_price")
                         if new_spot:
-                            spot = float(new_spot)
+                            new_spot = float(new_spot)
+                            if new_spot != pending_spot:
+                                pending_spot = new_spot
+                                last_spot_update = ts
 
                     for s, inst in chosen.items():
                         name = inst["instrument_name"]
@@ -431,6 +485,13 @@ async def live_stream(client: DeribitWS, asset: str, strikes: List[float], inter
 
                 current_time = time.time()
                 if current_time - last_output >= interval:
+                    # Log pending spot update if it differs from last logged value
+                    if pending_spot is not None and pending_spot != last_spot_value:
+                        spot = pending_spot
+                        logger.info("Updated spot via WebSocket: %s", spot)
+                        last_spot_value = spot
+                    pending_spot = None  # Reset for next cycle
+
                     now_ts = now_unix()
                     results = []
                     for s in chosen:
@@ -487,7 +548,7 @@ async def live_stream(client: DeribitWS, asset: str, strikes: List[float], inter
                             "timestamp": now_unix(),
                             "results": results,
                         }
-                        print(json.dumps(output), flush=True)
+                        print_formatted_output(output)
                         csv_logger.log_data(output)
                         if callback:
                             callback(output)
@@ -510,6 +571,8 @@ async def live_stream(client: DeribitWS, asset: str, strikes: List[float], inter
                     await client.subscribe(ch)
     finally:
         csv_logger.close()
+        plt.ioff()
+        plt.show()
 
 # ---------- CLI & entry ----------
 def parse_strikes_list(arr: List[str]) -> List[float]:

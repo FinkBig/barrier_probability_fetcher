@@ -7,3 +7,4 @@ monthly_day_max: 3
 interval: 5
 reconnect_delays: [5, 10, 20, 40]
 iv_timeout: 30
+spot_timeout: 60
